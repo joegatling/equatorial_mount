@@ -68,10 +68,10 @@ constexpr unsigned long CALIBRATION_DOUBLE_PRESS_TIME_MS = 1000;
 // Calibration Timings
 constexpr uint32_t CALIBRATION_SLEW_ACCELERATION = 20000;
 constexpr uint32_t CALIBRATION_SLEW_SPEED_HZ = 20000;
-constexpr float CALIBRATION_SLEW_STEPS = MOTOR_STEPS_PER_REVOLUTION * MICROSTEPPING * GEAR_RATIO / 100.0f;
+constexpr float CALIBRATION_SLEW_STEPS = MOTOR_STEPS_PER_REVOLUTION * MICROSTEPPING * GEAR_RATIO / (360);
 
-constexpr unsigned long CALIBRATION_SETTLE_TIME_MS = 1000;
-constexpr unsigned long CALIBRATION_CAPTURE_TIME_MS = 3000;
+constexpr unsigned long CALIBRATION_SETTLE_TIME_MS = 500;
+constexpr unsigned long CALIBRATION_CAPTURE_TIME_MS = 500;
 
 constexpr unsigned long CALIBRATION_START_TIME_MS = 2000;
 
@@ -104,6 +104,10 @@ unsigned long calibrationTimer = 0;
 CalibrationStep currentCalibrationStep = CalibrationStep::Slew;
 float calibrationMoveError = 0;
 
+bool triggerModeActive = false;
+unsigned long lastTriggerTime = 0;
+const unsigned long triggerInterval = 2000;
+
 void setMode(Mode newMode)
 {
   if (currentMode != newMode)
@@ -111,6 +115,11 @@ void setMode(Mode newMode)
     auto previousMode = currentMode;
     currentMode = newMode;
     currentModeStartTime = millis();
+
+    if(previousMode == Mode::Calibration)
+    {
+      keyboard.end();  
+    }
 
     if(stepper == nullptr)
     {
@@ -160,6 +169,10 @@ void setMode(Mode newMode)
         stepper->stopMove();
         calibrationTimer = millis();
         currentCalibrationStep = CalibrationStep::Starting;
+
+        keyboard.setLogLevel(HIDLogLevel::Off);
+        keyboard.begin();  
+
         break;
     }
   }
@@ -233,11 +246,15 @@ void startProvisioningAP()
 
 void setupButtons()
 {
-  slewClockwiseButton.SetBeginPressCallback([]() {
+  slewClockwiseButton.SetLongPressDuration(500);
+  slewCounterClockwiseButton.SetLongPressDuration(500);
+  hemisphereButton.SetLongPressDuration(2000);
+
+  slewClockwiseButton.SetBeginHoldCallback([]() {
     setMode(Mode::SlewingClockwise);
   });
 
-  slewClockwiseButton.SetEndPressCallback([]() {
+  slewClockwiseButton.SetEndHoldCallback([]() {
     if(currentMode == Mode::SlewingClockwise) 
     {
       if(currentHemisphere == Hemisphere::Northern) 
@@ -251,11 +268,11 @@ void setupButtons()
     }
   });
 
-  slewCounterClockwiseButton.SetBeginPressCallback([]() {
+  slewCounterClockwiseButton.SetBeginHoldCallback([]() {
     setMode(Mode::SlewingCounterClockwise);
   });
 
-  slewCounterClockwiseButton.SetEndPressCallback([]() {
+  slewCounterClockwiseButton.SetEndHoldCallback([]() {
     if(currentMode == Mode::SlewingCounterClockwise) 
     {
       if(currentHemisphere == Hemisphere::Northern) 
@@ -266,6 +283,22 @@ void setupButtons()
       else 
       {
         setMode(Mode::TrackingSouthern);
+      }
+    }
+  });
+
+  slewCounterClockwiseButton.SetEndPressCallback([]() {
+    if(currentMode != Mode::Calibration)
+    {
+      triggerModeActive = !triggerModeActive;
+
+      if(triggerModeActive)
+      {
+        keyboard.begin();
+      }
+      else
+      {
+        keyboard.end();
       }
     }
   });
@@ -298,7 +331,6 @@ void setupButtons()
     }
   });
 
-  hemisphereButton.SetLongPressDuration(2000);
   hemisphereButton.SetBeginHoldCallback([]() 
   {
     isWifiOn = !isWifiOn;
@@ -532,9 +564,6 @@ void setup()
   pinMode(PIN_LED, OUTPUT);
   digitalWrite(PIN_LED, LOW);
 
-  keyboard.setLogLevel(HIDLogLevel::Normal);
-  keyboard.begin();  
-
   engine.init();
   stepper = engine.stepperConnectToPin(STEP_PIN);
 
@@ -621,6 +650,26 @@ void updateCalibration()
   }
 }
 
+void updateTriggerMode()
+{
+  if(triggerModeActive == false)
+  {
+    return;
+  }
+
+  if(currentMode == Mode::TrackingNorthern || currentMode == Mode::TrackingSouthern)
+  {
+    if(keyboard.isConnected())
+    {
+      if(millis() - lastTriggerTime > triggerInterval)
+      {
+        keyboard.tap(MEDIA_VOLUME_UP);
+        lastTriggerTime = millis();
+      }
+    }
+  }
+}
+
 unsigned long lastTestTime = 0;
 
 void loop()
@@ -634,5 +683,5 @@ void loop()
   updateConnection();
   updateCalibration();
   
-
+  updateTriggerMode();
 }
