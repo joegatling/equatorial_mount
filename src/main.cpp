@@ -14,6 +14,8 @@
 #define PREFERENCES_WIFI_KEY "wifi"
 #define PREFERENCES_SSID_KEY "ssid"
 #define PREFERENCES_PASSWORD_KEY "pass"
+#define PREFERENCES_TRIGGER_INTERVAL_KEY "trig"
+#define PREFERENCES_TRACKING_TRIM_PPM_KEY "trim"
 
 enum class Hemisphere {
   Northern,
@@ -45,9 +47,9 @@ constexpr uint8_t DIRECTION_PIN = 0;
 constexpr uint8_t STEP_PIN = 1;
 constexpr float MOTOR_STEPS_PER_REVOLUTION = 200.0; // 1.8 degree step angle
 constexpr int MICROSTEPPING = 64;
-constexpr float SIDEREAL_DAY_SECONDS = 86164.091f;
+constexpr float SIDEREAL_DAY_SECONDS = 86164.0905f;
 
-constexpr uint32_t ACCELERATION = 30000;
+constexpr uint32_t ACCELERATION = 10000;
 constexpr uint32_t SLEWING_SPEED_HZ = 20000; // Steps per second for slewing
 
 constexpr uint8_t PIN_ADVANCE_BUTTON = GPIO_NUM_2;
@@ -58,10 +60,27 @@ constexpr uint8_t PIN_LED = GPIO_NUM_8;
 constexpr char SETUP_AP_SSID[] = "Ministar-OTA";
 static const char* MDNS_NAME = "ministar";
 constexpr char SETUP_AP_PASSWORD[] = "space123";
+constexpr char PAGE_STYLE[] =
+  "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+  "<style>"
+  "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;margin:0;padding:24px;background:#f6f7fb;color:#1f2937;}"
+  "main{max-width:520px;margin:0 auto;background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:20px;box-shadow:0 8px 24px rgba(17,24,39,.08);}"
+  "h1{font-size:1.4rem;margin:0 0 16px;}"
+  "h2{font-size:1rem;margin:18px 0 10px;color:#374151;}"
+  "label{display:block;font-size:.92rem;font-weight:600;margin:8px 0 4px;}"
+  ".radio-option{display:inline-flex;align-items:center;margin:6px 14px 6px 0;font-weight:500;}"
+  "input[type='text'],input[type='password'],input[type='number'],input:not([type]){width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #d1d5db;border-radius:8px;background:#fff;}"
+  "input[type='radio']{margin:0 6px 0 0;}"
+  "button,input[type='submit']{margin-top:10px;padding:10px 14px;border:0;border-radius:8px;background:#2563eb;color:#fff;font-weight:600;cursor:pointer;}"
+  "button:disabled,input[type='submit']:disabled{background:#9ca3af;cursor:not-allowed;}"
+  "p{margin:8px 0 0;color:#4b5563;}"
+  "</style>";
 
-constexpr float GEAR_RATIO = 114 + (6.0f / 17.0f); // Negative for reverse direction, 114.3529411765 : 1 
-constexpr uint32_t MICROSTEPS_PER_DAY = MOTOR_STEPS_PER_REVOLUTION * MICROSTEPPING * GEAR_RATIO;
-constexpr uint32_t EARTH_ROTATION_MILLIHZ_PER_STEP = MICROSTEPS_PER_DAY / SIDEREAL_DAY_SECONDS * 1000; // Millihertz per step for sidereal tracking (1 revolution per 23h56m4s)
+constexpr double GEAR_RATIO = 114 + (6.0f / 17.0f); // Negative for reverse direction, 114.3529411765 : 1 
+constexpr double MICROSTEPS_PER_DAY = MOTOR_STEPS_PER_REVOLUTION * MICROSTEPPING * GEAR_RATIO;
+constexpr uint32_t EARTH_ROTATION_MILLIHZ_PER_STEP = static_cast<uint32_t>(((MICROSTEPS_PER_DAY / SIDEREAL_DAY_SECONDS) * 1000.0) + 0.5); // Millihertz per step for sidereal tracking (1 revolution per 23h56m4s)
+constexpr int32_t TRACKING_TRIM_PPM_MIN = -5000;
+constexpr int32_t TRACKING_TRIM_PPM_MAX = 5000;
 
 constexpr unsigned long CALIBRATION_DOUBLE_PRESS_TIME_MS = 1000;
 
@@ -106,7 +125,23 @@ float calibrationMoveError = 0;
 
 bool triggerModeActive = false;
 unsigned long lastTriggerTime = 0;
-const unsigned long triggerInterval = 2000;
+unsigned long triggerInterval = 2000;
+int32_t trackingTrimPpm = 0;
+uint32_t trackingSpeedMilliHz = EARTH_ROTATION_MILLIHZ_PER_STEP;
+
+uint32_t calculateTrackingSpeedMilliHz(int32_t trimPpm)
+{
+  int32_t clampedTrimPpm = constrain(trimPpm, TRACKING_TRIM_PPM_MIN, TRACKING_TRIM_PPM_MAX);
+  double trimScale = 1.0 + (static_cast<double>(clampedTrimPpm) / 1000000.0);
+  double adjustedMilliHz = static_cast<double>(EARTH_ROTATION_MILLIHZ_PER_STEP) * trimScale;
+
+  if (adjustedMilliHz < 1.0)
+  {
+    return 1;
+  }
+
+  return static_cast<uint32_t>(lround(adjustedMilliHz));
+}
 
 void setMode(Mode newMode)
 {
@@ -140,7 +175,7 @@ void setMode(Mode newMode)
         }
         else
         {
-          stepper->setSpeedInMilliHz(EARTH_ROTATION_MILLIHZ_PER_STEP);
+          stepper->setSpeedInMilliHz(trackingSpeedMilliHz);
           stepper->runForward();
         }
         break;
@@ -153,7 +188,7 @@ void setMode(Mode newMode)
         }
         else
         {
-          stepper->setSpeedInMilliHz(EARTH_ROTATION_MILLIHZ_PER_STEP);
+          stepper->setSpeedInMilliHz(trackingSpeedMilliHz);
           stepper->runBackward();
         }
         break;
@@ -194,7 +229,6 @@ bool connectToWiFi()
     }
 
     Serial.printf("Connecting to %s\n", ssid.c_str());
-    Serial.printf("Password: %s\n", pass.c_str());
 
     WiFi.mode(WIFI_STA);
     WiFi.begin(ssid.c_str(), pass.c_str());
@@ -355,21 +389,46 @@ void setupWebServer()
     {
         String html;
 
-        html += "<html><body>";
-        html += "<h2>Ministar WiFi Setup</h2>";
-        html += "<form action='/save' method='POST'>";
-        html += "SSID:<br>";
-        html += "<input name='s'><br><br>";
-        html += "Password:<br>";
-        html += "<input name='p' type='password'><br><br>";
+        preferences.begin(PREFERENCES_NAMESPACE, true);
+        html += "<html><head>";
+        html += PAGE_STYLE;
+        html += "</head><body><main>";
+        html += "<h1>Ministar Setup</h1>";
+        html += "<h2>WiFi</h2>";
+        html += "<form action='/save_wifi' method='POST'>";
+        html += "<label for='ssid'>SSID</label>";
+        html += "<input name='s' id='ssid' value='" + preferences.getString(PREFERENCES_SSID_KEY, "") + "'><br>";
+        html += "<label for='password'>Password</label>";
+        html += "<input name='p' id='password' type='password'><br><br>";
+        html += "<input id='wifiSaveButton' type='submit' value='Save' disabled>";
+        html += "</form>";
+        html += "<script>"
+          "const passwordInput=document.getElementById('password');"
+          "const wifiSaveButton=document.getElementById('wifiSaveButton');"
+          "const updateWifiSaveState=()=>{wifiSaveButton.disabled=passwordInput.value.trim().length===0;};"
+          "passwordInput.addEventListener('input',updateWifiSaveState);"
+          "updateWifiSaveState();"
+          "</script>";
+        preferences.end();
+
+        html += "<h2>General Setup</h2>";
+        html += "<form action='/save_config' method='POST'>";
+        html += "<label class='radio-option'><input name='h' type='radio' id='northern' value='northern' " + String(currentHemisphere == Hemisphere::Northern ? "checked" : "") + ">Northern Hemisphere</label><br>";
+        html += "<label class='radio-option'><input name='h' type='radio' id='southern' value='southern' " + String(currentHemisphere == Hemisphere::Southern ? "checked" : "") + ">Southern Hemisphere</label><br>";
+        html += "<label for='triggerInterval'>Shutter Trigger Interval</label>";
+        html += "<input name='t' id='triggerInterval' type='number' min='100' max='30000' step='1' value='" + String(triggerInterval) + "'><br><br>";
+        html += "<label for='trackingTrim'>RA Tracking Trim (ppm)</label>";
+        html += "<input name='r' id='trackingTrim' type='number' min='" + String(TRACKING_TRIM_PPM_MIN) + "' max='" + String(TRACKING_TRIM_PPM_MAX) + "' step='1' value='" + String(trackingTrimPpm) + "'><p>Use small values to fine-tune RA speed: positive = faster, negative = slower.</p><br>";
+        html += "<p>Current RA tracking speed: " + String(trackingSpeedMilliHz) + " mHz (" + String(trackingSpeedMilliHz / 1000.0, 3) + " steps/s), trim " + String(trackingTrimPpm) + " ppm.</p>";
         html += "<input type='submit' value='Save'>";
         html += "</form>";
-        html += "</body></html>";
+
+        html += "</main></body></html>";
 
         webServer.send(200, "text/html", html);
     });
 
-    webServer.on("/save", HTTP_POST, []()
+    webServer.on("/save_wifi", HTTP_POST, []()
     {
         String ssid = webServer.arg("s");
         String pass = webServer.arg("p");
@@ -379,16 +438,55 @@ void setupWebServer()
         preferences.putString(PREFERENCES_PASSWORD_KEY, pass);
         preferences.end();
 
-        webServer.send(200, "text/html",
-            "<html><body>"
-            "<h2>Saved. Rebooting...</h2>"
-            "</body></html>");
+        String html = "<html><head>";
+        html += "<meta http-equiv='refresh' content='10;url=/'>";
+        html += PAGE_STYLE;
+        html += "</head><body><main>";
+        html += "<h2>Saved. Rebooting...</h2>";
+        html += "<p>Your WiFi settings were stored.</p>";
+        html += "<p>You will be redirected to the config page in 10 seconds.</p>";
+        html += "</main></body></html>";
+
+        webServer.send(200, "text/html", html);
 
         delay(1000);
 
         ESP.restart();
     });
 
+    webServer.on("/save_config", HTTP_POST, []()
+    {
+        String hemisphere = webServer.arg("h");
+        bool isSouthern = hemisphere == "southern";
+        String triggerIntervalStr = webServer.arg("t");
+        triggerInterval = MAX(100, MIN(30000, triggerIntervalStr.toInt()));
+        String trackingTrimStr = webServer.arg("r");
+        trackingTrimPpm = constrain(trackingTrimStr.toInt(), TRACKING_TRIM_PPM_MIN, TRACKING_TRIM_PPM_MAX);
+        trackingSpeedMilliHz = calculateTrackingSpeedMilliHz(trackingTrimPpm);
+
+        preferences.begin(PREFERENCES_NAMESPACE, false);
+        preferences.putBool(PREFERENCES_SOUTHERN_HEMISPHERE_KEY, isSouthern);
+        preferences.putULong(PREFERENCES_TRIGGER_INTERVAL_KEY, triggerInterval);
+        preferences.putInt(PREFERENCES_TRACKING_TRIM_PPM_KEY, trackingTrimPpm);
+        preferences.end();
+
+        String html = "<html><head>";
+        html += "<meta http-equiv='refresh' content='10;url=/'>";
+        html += PAGE_STYLE;
+        html += "</head><body><main>";
+        html += "<h2>Saved. Rebooting...</h2>";
+        html += "<p>Your configuration was stored.</p>";
+        html += "<p>You will be redirected to the config page in 10 seconds.</p>";
+        html += "</main></body></html>";
+
+        webServer.send(200, "text/html", html);
+
+        delay(1000);
+
+        ESP.restart();
+    });    
+
+    
     // Helps macOS quickly realize there is no internet.
     webServer.on("/hotspot-detect.html", HTTP_GET, []()
     {
@@ -520,7 +618,7 @@ void updateHemisphereDemo()
   {
     trackingDemoMode = false;
     
-    stepper->setSpeedInMilliHz(EARTH_ROTATION_MILLIHZ_PER_STEP);
+    stepper->setSpeedInMilliHz(trackingSpeedMilliHz);
 
     if(currentMode == Mode::TrackingNorthern)
     {
@@ -558,6 +656,9 @@ void setup()
   bool isSouthernHemisphere = preferences.getBool(PREFERENCES_SOUTHERN_HEMISPHERE_KEY, false);
   currentHemisphere = isSouthernHemisphere ? Hemisphere::Southern : Hemisphere::Northern;
   isWifiOn = preferences.getBool(PREFERENCES_WIFI_KEY, false);
+  triggerInterval = preferences.getULong(PREFERENCES_TRIGGER_INTERVAL_KEY, triggerInterval);
+  trackingTrimPpm = constrain(preferences.getInt(PREFERENCES_TRACKING_TRIM_PPM_KEY, 0), TRACKING_TRIM_PPM_MIN, TRACKING_TRIM_PPM_MAX);
+  trackingSpeedMilliHz = calculateTrackingSpeedMilliHz(trackingTrimPpm);
   
   preferences.end();
 
